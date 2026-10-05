@@ -11,7 +11,7 @@
 > 已知问题：Intel Core Ultra 等 P 核 + E 核混合架构需要在 EPT 初始化时按逻辑处理器适配能力，
 > 详见 [Intel Core Ultra 大小核（P/E）的 EPT 适配](#hybrid-ept)。
 
-UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系：以内核 VT-x 虚拟机监控器（Hypervisor）为核心，
+UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系：以内核 VT-x Hypervisor 为核心，
 通过 EPT 钩子、无痕断点和对 Dbgk（Windows 内核调试子系统）的接管，把常规用户态调试器接到受保护进程上，
 用于对抗驱动侧的反调试检测。项目最初面向 Windows 10 / Windows 11 x64，与具体系统版本的内核符号、
 结构偏移和特征码强相关。
@@ -25,14 +25,14 @@ UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系�
 
 ## 核心能力
 
-- **VT-x 虚拟机监控器（Hypervisor）宿主**：VMXON / VMLAUNCH、VMCS 管理、VM-exit（VM 退出）分发、VMCALL 网关，
+- **VT-x Hypervisor 宿主**：VMXON / VMLAUNCH、VMCS 管理、VM-exit 分发、VMCALL 网关，
   按逻辑处理器维护 vCPU 上下文。
 - **EPT 内存虚拟化**：EPT 页表与影子页管理，支持 EPT 执行钩子、内存读写执行监视、
   假页（fake page）内存读取以及 EPT 函数钩子。
 - **无痕断点**：隐藏软件断点（0xCC）的实际字节、读取被隐藏的断点内容、保护调试寄存器（DRx），
   让目标进程和反调试驱动看不到断点痕迹。
 - **VMCALL 控制接口**：内置 21 个功能号，覆盖 VMXOFF、INVEPT、EPT 钩子/摘钩、
-  隐藏虚拟机监控器存在、软件断点隐藏与读取、EPT 读/写/执行监视、VMCS 状态导出等。
+  隐藏 Hypervisor 存在、软件断点隐藏与读取、EPT 读/写/执行监视、VMCS 状态导出等。
 - **Dbgk 接管**：解析 `ntoskrnl`、`win32kbase`、`win32kfull` 的符号，
   以 EPT 函数钩子接管 Dbgk / Psp 内部例程，重定向调试对象与调试事件流。
 - **调试器侧 Hook DLL**：注入第三方调试器进程，Hook `NtDebugActiveProcess`、
@@ -59,7 +59,7 @@ UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系�
                 | AIHelper!LoadNT            | CreateProcess + InjectDll
                 v                            v
 +-----------------------------+   +------------------------------+
-| VT_Driver.sys（虚拟机监控器） |   | Hook.dll / Hook64.dll         |
+| VT_Driver.sys（Hypervisor） |   | Hook.dll / Hook64.dll         |
 |   VMXON / VMCS / EPT        |<--|  调试 API Hook + VMCALL 包装   |
 |   VM-exit / VMCALL 分发     |   |  Detours + EPT 钩子           |
 +--------------+--------------+   +---------------+--------------+
@@ -75,7 +75,7 @@ UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系�
 
 | 层 | 组件 | 运行位置 | 职责 |
 |---|---|---|---|
-| 虚拟机监控器（Hypervisor） | `VT_Driver.sys` | Ring 0 | 在 Intel VT-x 下运行原系统，提供 EPT 钩子与 VMCALL 服务 |
+| Hypervisor | `VT_Driver.sys` | Ring 0 | 在 Intel VT-x 下运行原系统，提供 EPT 钩子与 VMCALL 服务 |
 | 调试支撑驱动 | `DbgkSysWin10/11.sys` | Ring 0 | 解析符号、接管 Dbgk、管理断点、加解密 IOCTL 数据 |
 | 调度层 | `UnrealDbgDll.dll` | Ring 3 | 装载驱动、下发密钥与调试数据、拉起并注入调试器 |
 | 调试器侧 | `Hook.dll` / `Hook64.dll` | 目标调试器进程 | Hook 调试 API，通过 IOCTL / VMCALL 协调驱动 |
@@ -87,7 +87,7 @@ UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系�
 ```text
 .
 ├─ UnrealDbg.sln              # VS 解决方案（6 个 C++ 工程）
-├─ VT_Driver/                 # VT-x 虚拟机监控器宿主驱动（C++ / ASM，WDM）
+├─ VT_Driver/                 # VT-x Hypervisor 宿主驱动（C++ / ASM，WDM）
 ├─ DbgkSysWin10/              # Windows 10 调试支撑驱动（WDM）
 ├─ DbgkSysWin11/              # Windows 11 调试支撑驱动（WDM）
 ├─ UnrealDbgDll/              # Ring3 调度 DLL（导出接口）
@@ -105,7 +105,7 @@ UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系�
 
 ## 模块详解
 
-### 1. VT_Driver（虚拟机监控器宿主）
+### 1. VT_Driver（Hypervisor 宿主）
 
 `DriverEntry`（`VT_Driver/Driver.cpp`）的执行顺序：
 
@@ -123,10 +123,10 @@ UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系�
 |---|---|
 | `Driver.cpp` | 驱动入口/出口，初始化 VT 与符号表 |
 | `vmm.cpp` / `vmcs.cpp` | vCPU 管理、VMCS 字段读写与初始化 |
-| `vmexit_handler.cpp` | VM-exit（VM 退出）分发：指令调整、异常注入、EPT 处理等 |
+| `vmexit_handler.cpp` | VM-exit 分发：指令调整、异常注入、EPT 处理等 |
 | `vmcall_handler.cpp` | VMCALL 功能号分发与参数解析 |
 | `EPT.cpp` | EPT 页表、钩子页、内存监视与假页实现 |
-| `hypervisor_gateway.cpp` | 宿主侧封装：EPT 钩子、INVEPT、VMXOFF、隐藏虚拟机监控器等 |
+| `hypervisor_gateway.cpp` | 宿主侧封装：EPT 钩子、INVEPT、VMXOFF、隐藏 Hypervisor 等 |
 | `ASM/*.asm` | VMX 指令封装、VM-exit 入口、中断处理与 LDE64 长度反汇编 |
 | `crx.h` / `drx.h` / `msr.h` / `mtrr.h` | 控制寄存器、调试寄存器、MSR 与 MTRR 支持 |
 
@@ -258,7 +258,7 @@ InitGlobalVariables() -> InitFunction() -> SetupHook()
 
 ## 通信接口
 
-### VMCALL（客户机到虚拟机监控器）
+### VMCALL（Guest 到 Hypervisor）
 
 功能号定义见 `VT_Driver/vmcall_reason.h`，由 VT 宿主在 `vmcall_handler.cpp` 中分发：
 
@@ -274,8 +274,8 @@ InitGlobalVariables() -> InitFunction() -> SetupHook()
 | 7 | `VMCALL_INVEPT_CONTEXT` | 失效 EPT TLB 上下文 |
 | 8 | `VMCALL_DUMP_POOL_MANAGER` | 导出池管理器信息 |
 | 9 | `VMCALL_DUMP_VMCS_STATE` | 导出 VMCS 状态 |
-| 10 | `VMCALL_HIDE_HV_PRESENCE` | 隐藏虚拟机监控器存在（CPUID） |
-| 11 | `VMCALL_UNHIDE_HV_PRESENCE` | 恢复虚拟机监控器可见 |
+| 10 | `VMCALL_HIDE_HV_PRESENCE` | 隐藏 Hypervisor 存在（CPUID） |
+| 11 | `VMCALL_UNHIDE_HV_PRESENCE` | 恢复 Hypervisor 可见 |
 | 12 | `VMCALL_HIDE_SOFTWARE_BREAKPOINT` | 隐藏软件断点 |
 | 13 | `VMCALL_READ_SOFTWARE_BREAKPOINT` | 读取被隐藏的软件断点内容 |
 | 14 | `VMCALL_READ_EPT_FAKE_PAGE_MEMORY` | 读取 EPT 假页原始内存 |
@@ -404,7 +404,7 @@ VTDebugger.exe          # Loader，首次运行可下载符号
 UnrealDbgDll.dll        # Ring3 调度层
 AIHelper.dll            # 驱动装载 / DLL 注入
 VMProtectSDK64.dll      # VMProtect 运行库
-VT_Driver.sys           # VT-x 虚拟机监控器
+VT_Driver.sys           # VT-x Hypervisor
 DbgkSysWin10.sys        # 或 DbgkSysWin11.sys，按系统版本二选一
 Hook.dll / Hook64.dll   # 注入调试器进程
 C:\Symbols\             # ntoskrnl / win32kbase / win32kfull 符号
