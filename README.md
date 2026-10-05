@@ -11,7 +11,7 @@
 > 已知问题：Intel Core Ultra 等 P 核 + E 核混合架构需要在 EPT 初始化时按逻辑处理器适配能力，
 > 详见 [Intel Core Ultra 大小核（P/E）的 EPT 适配](#hybrid-ept)。
 
-UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系：以内核 VT-x Hypervisor 为核心，
+UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系：以内核 VT-x 虚拟机监控器（Hypervisor）为核心，
 通过 EPT 钩子、无痕断点和对 Dbgk（Windows 内核调试子系统）的接管，把常规用户态调试器接到受保护进程上，
 用于对抗驱动侧的反调试检测。项目最初面向 Windows 10 / Windows 11 x64，与具体系统版本的内核符号、
 结构偏移和特征码强相关。
@@ -25,14 +25,14 @@ UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系�
 
 ## 核心能力
 
-- **VT-x Hypervisor 宿主**：VMXON / VMLAUNCH、VMCS 管理、VM-exit 分发、VMCALL 网关，
+- **VT-x 虚拟机监控器（Hypervisor）宿主**：VMXON / VMLAUNCH、VMCS 管理、VM-exit（VM 退出）分发、VMCALL 网关，
   按逻辑处理器维护 vCPU 上下文。
 - **EPT 内存虚拟化**：EPT 页表与影子页管理，支持 EPT 执行钩子、内存读写执行监视、
   假页（fake page）内存读取以及 EPT 函数钩子。
 - **无痕断点**：隐藏软件断点（0xCC）的实际字节、读取被隐藏的断点内容、保护调试寄存器（DRx），
   让目标进程和反调试驱动看不到断点痕迹。
 - **VMCALL 控制接口**：内置 21 个功能号，覆盖 VMXOFF、INVEPT、EPT 钩子/摘钩、
-  隐藏 Hypervisor 存在、软件断点隐藏与读取、EPT 读/写/执行监视、VMCS 状态导出等。
+  隐藏虚拟机监控器存在、软件断点隐藏与读取、EPT 读/写/执行监视、VMCS 状态导出等。
 - **Dbgk 接管**：解析 `ntoskrnl`、`win32kbase`、`win32kfull` 的符号，
   以 EPT 函数钩子接管 Dbgk / Psp 内部例程，重定向调试对象与调试事件流。
 - **调试器侧 Hook DLL**：注入第三方调试器进程，Hook `NtDebugActiveProcess`、
@@ -59,7 +59,7 @@ UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系�
                 | AIHelper!LoadNT            | CreateProcess + InjectDll
                 v                            v
 +-----------------------------+   +------------------------------+
-| VT_Driver.sys（Hypervisor） |   | Hook.dll / Hook64.dll         |
+| VT_Driver.sys（虚拟机监控器） |   | Hook.dll / Hook64.dll         |
 |   VMXON / VMCS / EPT        |<--|  调试 API Hook + VMCALL 包装   |
 |   VM-exit / VMCALL 分发     |   |  Detours + EPT 钩子           |
 +--------------+--------------+   +---------------+--------------+
@@ -75,7 +75,7 @@ UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系�
 
 | 层 | 组件 | 运行位置 | 职责 |
 |---|---|---|---|
-| Hypervisor | `VT_Driver.sys` | Ring 0 | 在 Intel VT-x 下运行原系统，提供 EPT 钩子与 VMCALL 服务 |
+| 虚拟机监控器（Hypervisor） | `VT_Driver.sys` | Ring 0 | 在 Intel VT-x 下运行原系统，提供 EPT 钩子与 VMCALL 服务 |
 | 调试支撑驱动 | `DbgkSysWin10/11.sys` | Ring 0 | 解析符号、接管 Dbgk、管理断点、加解密 IOCTL 数据 |
 | 调度层 | `UnrealDbgDll.dll` | Ring 3 | 装载驱动、下发密钥与调试数据、拉起并注入调试器 |
 | 调试器侧 | `Hook.dll` / `Hook64.dll` | 目标调试器进程 | Hook 调试 API，通过 IOCTL / VMCALL 协调驱动 |
@@ -87,7 +87,7 @@ UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系�
 ```text
 .
 ├─ UnrealDbg.sln              # VS 解决方案（6 个 C++ 工程）
-├─ VT_Driver/                 # VT-x Hypervisor 宿主驱动（C++ / ASM，WDM）
+├─ VT_Driver/                 # VT-x 虚拟机监控器宿主驱动（C++ / ASM，WDM）
 ├─ DbgkSysWin10/              # Windows 10 调试支撑驱动（WDM）
 ├─ DbgkSysWin11/              # Windows 11 调试支撑驱动（WDM）
 ├─ UnrealDbgDll/              # Ring3 调度 DLL（导出接口）
@@ -105,7 +105,7 @@ UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系�
 
 ## 模块详解
 
-### 1. VT_Driver（Hypervisor 宿主）
+### 1. VT_Driver（虚拟机监控器宿主）
 
 `DriverEntry`（`VT_Driver/Driver.cpp`）的执行顺序：
 
@@ -123,10 +123,10 @@ UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系�
 |---|---|
 | `Driver.cpp` | 驱动入口/出口，初始化 VT 与符号表 |
 | `vmm.cpp` / `vmcs.cpp` | vCPU 管理、VMCS 字段读写与初始化 |
-| `vmexit_handler.cpp` | VM-exit 分发：指令调整、异常注入、EPT 处理等 |
+| `vmexit_handler.cpp` | VM-exit（VM 退出）分发：指令调整、异常注入、EPT 处理等 |
 | `vmcall_handler.cpp` | VMCALL 功能号分发与参数解析 |
 | `EPT.cpp` | EPT 页表、钩子页、内存监视与假页实现 |
-| `hypervisor_gateway.cpp` | 宿主侧封装：EPT 钩子、INVEPT、VMXOFF、隐藏 Hypervisor 等 |
+| `hypervisor_gateway.cpp` | 宿主侧封装：EPT 钩子、INVEPT、VMXOFF、隐藏虚拟机监控器等 |
 | `ASM/*.asm` | VMX 指令封装、VM-exit 入口、中断处理与 LDE64 长度反汇编 |
 | `crx.h` / `drx.h` / `msr.h` / `mtrr.h` | 控制寄存器、调试寄存器、MSR 与 MTRR 支持 |
 
@@ -258,7 +258,7 @@ InitGlobalVariables() -> InitFunction() -> SetupHook()
 
 ## 通信接口
 
-### VMCALL（Guest 到 Hypervisor）
+### VMCALL（客户机到虚拟机监控器）
 
 功能号定义见 `VT_Driver/vmcall_reason.h`，由 VT 宿主在 `vmcall_handler.cpp` 中分发：
 
@@ -274,8 +274,8 @@ InitGlobalVariables() -> InitFunction() -> SetupHook()
 | 7 | `VMCALL_INVEPT_CONTEXT` | 失效 EPT TLB 上下文 |
 | 8 | `VMCALL_DUMP_POOL_MANAGER` | 导出池管理器信息 |
 | 9 | `VMCALL_DUMP_VMCS_STATE` | 导出 VMCS 状态 |
-| 10 | `VMCALL_HIDE_HV_PRESENCE` | 隐藏 Hypervisor 存在（CPUID） |
-| 11 | `VMCALL_UNHIDE_HV_PRESENCE` | 恢复 Hypervisor 可见 |
+| 10 | `VMCALL_HIDE_HV_PRESENCE` | 隐藏虚拟机监控器存在（CPUID） |
+| 11 | `VMCALL_UNHIDE_HV_PRESENCE` | 恢复虚拟机监控器可见 |
 | 12 | `VMCALL_HIDE_SOFTWARE_BREAKPOINT` | 隐藏软件断点 |
 | 13 | `VMCALL_READ_SOFTWARE_BREAKPOINT` | 读取被隐藏的软件断点内容 |
 | 14 | `VMCALL_READ_EPT_FAKE_PAGE_MEMORY` | 读取 EPT 假页原始内存 |
@@ -404,7 +404,7 @@ VTDebugger.exe          # Loader，首次运行可下载符号
 UnrealDbgDll.dll        # Ring3 调度层
 AIHelper.dll            # 驱动装载 / DLL 注入
 VMProtectSDK64.dll      # VMProtect 运行库
-VT_Driver.sys           # VT-x Hypervisor
+VT_Driver.sys           # VT-x 虚拟机监控器
 DbgkSysWin10.sys        # 或 DbgkSysWin11.sys，按系统版本二选一
 Hook.dll / Hook64.dll   # 注入调试器进程
 C:\Symbols\             # ntoskrnl / win32kbase / win32kfull 符号
@@ -431,8 +431,8 @@ C:\Symbols\             # ntoskrnl / win32kbase / win32kfull 符号
 当前代码的 EPT 初始化还没有按逻辑处理器做能力适配。可能的表现：
 
 - 驱动只在部分核心完成 VMXON / VMLAUNCH，其余核心初始化失败；
-- 第一次 EPT 钩子或内存监视触发时出现 VM-entry 失败、EPT misconfiguration；
-- 在不支持 INVEPT 的核心上，root 模式执行 INVEPT 触发 #UD，未捕获时表现为
+- 第一次 EPT 钩子或内存监视触发时出现虚拟机进入（VM-entry）失败或 EPT 配置错误（EPT misconfiguration）；
+- 在不支持 INVEPT 的核心上，VMX 根模式（root mode）下执行 INVEPT 触发 #UD；未捕获时表现为
   `KMODE_EXCEPTION_NOT_HANDLED` 蓝屏。
 
 ### 代码层面的根因
@@ -440,26 +440,26 @@ C:\Symbols\             # ntoskrnl / win32kbase / win32kfull 符号
 | 位置 | 当前实现 | 异构核风险 |
 |---|---|---|
 | `VT_Driver/vmm.cpp: allocate_vmm_context()` | `ept::build_mtrr_map()`、`init_vcpu()`、`ept::initialize()` 都在驱动加载时所在的单个逻辑处理器上执行；此时还没有进入按核切换亲和性的循环 | 所有 vCPU 的 EPT 页表、`EPTP`、MTRR 缓存类型都来自同一个核的能力与配置 |
-| `VT_Driver/EPT.cpp: initialize()` | 固定 `ept_pointer->memory_type = MEMORY_TYPE_WRITE_BACK`、`page_walk_length = 3`（4 级页遍历）；`create_ept_page_table()` 把所有 PDE 设为 2MB 大页 | 没有读取 `IA32_VMX_EPT_VPID_CAP` 的 bit 14（WB）、bit 6（4 级）、bit 16（2MB）、bit 20 / 25 / 26（INVEPT）等能力位 |
-| `VT_Driver/invalid_ept.cpp`、`vmexit_handler.cpp`、`EPT.cpp` | 无条件调用 `invept_all_contexts_func()` / `invept_single_context_func()`；`Globals.cpp: enter_vmx_operation()` 在 VMXON 成功后也会立即执行一次 INVEPT | 当前核不支持 INVEPT 时，root 模式执行 INVEPT 会产生 #UD；内核未捕获时直接蓝屏 |
-| `VT_Driver/Globals.cpp: enter_vmx_operation()` / `load_vmcs_pointer()` | 每次都在目标核上重新读取 `IA32_VMX_BASIC`，写入 VMXON / VMCS 的 revision ID | 这部分已经是每核正确的，但 EPT 部分没有同样的处理 |
+| `VT_Driver/EPT.cpp: initialize()` | 固定 `ept_pointer->memory_type = MEMORY_TYPE_WRITE_BACK`、`page_walk_length = 3`（4 级页遍历）；`create_ept_page_table()` 把所有 PDE 设为 2MB 大页 | 没有读取 `IA32_VMX_EPT_VPID_CAP` 的位 14（WB，写回）、位 6（4 级页遍历）、位 16（2MB 大页）、位 20 / 25 / 26（INVEPT）等能力位 |
+| `VT_Driver/invalid_ept.cpp`、`vmexit_handler.cpp`、`EPT.cpp` | 无条件调用 `invept_all_contexts_func()` / `invept_single_context_func()`；`Globals.cpp: enter_vmx_operation()` 在 VMXON 成功后也会立即执行一次 INVEPT | 当前核不支持 INVEPT 时，VMX 根模式（root mode）下执行 INVEPT 会产生 #UD；内核未捕获时直接蓝屏 |
+| `VT_Driver/Globals.cpp: enter_vmx_operation()` / `load_vmcs_pointer()` | 每次都在目标核上重新读取 `IA32_VMX_BASIC`，写入 VMXON / VMCS 的修订标识（revision ID） | 这部分已经是每核正确的，但 EPT 部分没有同样的处理 |
 | `VT_Driver/vmcs.cpp: fill_vmcs()` / `ajdust_controls()` | 在目标核上读取 `IA32_VMX_*` 控制 MSR 并裁剪 VMCS 控制位 | VMCS 控制位会按核适配；但 `EPT_POINTER` 指向的 EPT 页表仍是单核构建的 |
 | `VT_Driver/vmm.cpp: vmm_init()` | `KeQueryActiveProcessorCount(NULL)` + `1ull << iter` | 只覆盖当前处理器组；>64 逻辑处理器或跨处理器组的机型需要改用 `GROUP_AFFINITY` |
 
 补充：`IA32_VMX_BASIC`、`IA32_VMX_EPT_VPID_CAP` 等 VMX 能力 MSR 都是每逻辑处理器 MSR。
-Intel SDM Vol. 3C 的 VMX Capability Reporting 要求软件在将要运行 VMX 的那个逻辑处理器上读取这些值；
+Intel SDM 第 3C 卷的 VMX 能力报告（VMX Capability Reporting）要求软件在将要运行 VMX 的逻辑处理器上读取这些值；
 P 核与 E 核属于不同微架构，报告的能力位可能不同，具体以实机 `rdmsr` 结果为准。
 
 ### 需要调整的 EPT 点（当前未实现）
 
 1. 把 EPT / MTRR 的能力探测和页表构建移进每核初始化路径（`init_logical_processor()` 内、切换到目标核之后），
    或至少在每个核上重新读取并校验能力。
-2. 每个核读取 `IA32_VMX_EPT_VPID_CAP`，至少处理：bit 20（INVEPT）、bit 25 / 26（single / all-context INVEPT）、
-   bit 6（4 级页遍历）、bit 14（WB）、bit 8（UC）、bit 16（2MB）、bit 21（A/D）。
-3. 选择“所有核都支持”的公共 EPT 配置：仅在所有核支持 2MB 时使用大页；仅在所有核支持 WB 时使用 WB；
-   `page_walk_length` 取公共支持值；否则退回 4KB 页 / UC，或拒绝加载并输出明确的错误信息。
+2. 每个核读取 `IA32_VMX_EPT_VPID_CAP`，至少处理：位 20（INVEPT）、位 25 / 26（单上下文 / 全上下文 INVEPT，single/all-context）、
+   位 6（4 级页遍历）、位 14（WB，写回）、位 8（UC，不可缓存）、位 16（2MB 大页）、位 21（A/D，访问/脏位）。
+3. 选择“所有核都支持”的公共 EPT 配置：仅在所有核支持 2MB 时使用大页；仅在所有核支持写回（WB）时使用 WB；
+   `page_walk_length` 取公共支持值；否则退回 4KB 页 / 不可缓存（UC），或拒绝加载并输出明确的错误信息。
 4. 给 INVEPT 增加能力检查；不支持 INVEPT 的核改用其它 TLB 失效路径，或直接返回不支持并报错，
-   不要在 root 模式下无条件执行。
+   不要在 VMX 根模式（root mode）下无条件执行。
 5. MTRR 缓存类型表改为每核读取 / 校验，至少校验 P 核与 E 核得到的 MTRR 配置是否一致。
 6. 处理器遍历改为处理器组感知（`KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS)` + `GROUP_AFFINITY`），
    并单独记录每个核的 VMXON / VMLAUNCH 结果；初始化中途失败时用 `hvgt::vmoff()` 做全核回滚
@@ -467,10 +467,10 @@ P 核与 E 核属于不同微架构，报告的能力位可能不同，具体以
 
 ### 实机验证建议
 
-- 分别把线程固定到 P 核和 E 核，读取 `IA32_VMX_BASIC`、`IA32_VMX_EPT_VPID_CAP`，对比 VMCS revision ID、
+- 分别把线程固定到 P 核和 E 核，读取 `IA32_VMX_BASIC`、`IA32_VMX_EPT_VPID_CAP`，对比 VMCS 修订标识（revision ID）、
   INVEPT、2MB、WB 等能力位；
-- 驱动加载失败时记录 `VM_INSTRUCTION_ERROR`（若出现 VMCS revision 不匹配，常见为 error 12，
-  具体以实测为准）和 bugcheck 参数；
+- 驱动加载失败时记录 `VM_INSTRUCTION_ERROR`（若出现 VMCS 修订标识不匹配，常见为错误码 12，
+  具体以实测为准）和蓝屏（bugcheck）参数；
 - 用 `KeSetSystemAffinityThreadEx()` 在单 P 核 / 单 E 核上分别加载驱动，确认问题是否与核类型相关。
 
 ## 已知限制
