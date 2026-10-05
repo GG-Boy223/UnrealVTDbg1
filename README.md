@@ -8,6 +8,9 @@
 
 状态：原始版本代码（本仓库未做完整构建与真机验证） · 平台：Windows 10 / Windows 11 x64 · 依赖：Intel VT-x + EPT
 
+> 已知问题：Intel Core Ultra 等 P 核 + E 核混合架构需要在 EPT 初始化时按逻辑处理器适配能力，
+> 详见 [Intel Core Ultra 大小核（P/E）的 EPT 适配](#hybrid-ept)。
+
 UnrealVTDbg（代码内的项目名为 UnrealDbg）是一套自建调试体系：以内核 VT-x Hypervisor 为核心，
 通过 EPT 钩子、无痕断点和对 Dbgk（Windows 内核调试子系统）的接管，把常规用户态调试器接到受保护进程上，
 用于对抗驱动侧的反调试检测。项目最初面向 Windows 10 / Windows 11 x64，与具体系统版本的内核符号、
@@ -420,12 +423,64 @@ C:\Symbols\             # ntoskrnl / win32kbase / win32kfull 符号
 （`AIHelper.dll`、`VMProtectSDK64.dll`、`UnrealDbg.aes` 等运行时依赖与发布产物）
 都不会进入源码提交；部署或发布时需要把这些文件单独放到运行目录，或作为 Release 附件分发。
 
+<a name="hybrid-ept"></a>
+
+## 已知问题：Intel Core Ultra 大小核（P/E）的 EPT 适配
+
+在 Intel Core Ultra（Meteor Lake / Arrow Lake / Lunar Lake 等）以及其它 P 核 + E 核混合架构上，
+当前代码的 EPT 初始化还没有按逻辑处理器做能力适配。可能的表现：
+
+- 驱动只在部分核心完成 VMXON / VMLAUNCH，其余核心初始化失败；
+- 第一次 EPT 钩子或内存监视触发时出现 VM-entry 失败、EPT misconfiguration；
+- 在不支持 INVEPT 的核心上，root 模式执行 INVEPT 触发 #UD，未捕获时表现为
+  `KMODE_EXCEPTION_NOT_HANDLED` 蓝屏。
+
+### 代码层面的根因
+
+| 位置 | 当前实现 | 异构核风险 |
+|---|---|---|
+| `VT_Driver/vmm.cpp: allocate_vmm_context()` | `ept::build_mtrr_map()`、`init_vcpu()`、`ept::initialize()` 都在驱动加载时所在的单个逻辑处理器上执行；此时还没有进入按核切换亲和性的循环 | 所有 vCPU 的 EPT 页表、`EPTP`、MTRR 缓存类型都来自同一个核的能力与配置 |
+| `VT_Driver/EPT.cpp: initialize()` | 固定 `ept_pointer->memory_type = MEMORY_TYPE_WRITE_BACK`、`page_walk_length = 3`（4 级页遍历）；`create_ept_page_table()` 把所有 PDE 设为 2MB 大页 | 没有读取 `IA32_VMX_EPT_VPID_CAP` 的 bit 14（WB）、bit 6（4 级）、bit 16（2MB）、bit 20 / 25 / 26（INVEPT）等能力位 |
+| `VT_Driver/invalid_ept.cpp`、`vmexit_handler.cpp`、`EPT.cpp` | 无条件调用 `invept_all_contexts_func()` / `invept_single_context_func()`；`Globals.cpp: enter_vmx_operation()` 在 VMXON 成功后也会立即执行一次 INVEPT | 当前核不支持 INVEPT 时，root 模式执行 INVEPT 会产生 #UD；内核未捕获时直接蓝屏 |
+| `VT_Driver/Globals.cpp: enter_vmx_operation()` / `load_vmcs_pointer()` | 每次都在目标核上重新读取 `IA32_VMX_BASIC`，写入 VMXON / VMCS 的 revision ID | 这部分已经是每核正确的，但 EPT 部分没有同样的处理 |
+| `VT_Driver/vmcs.cpp: fill_vmcs()` / `ajdust_controls()` | 在目标核上读取 `IA32_VMX_*` 控制 MSR 并裁剪 VMCS 控制位 | VMCS 控制位会按核适配；但 `EPT_POINTER` 指向的 EPT 页表仍是单核构建的 |
+| `VT_Driver/vmm.cpp: vmm_init()` | `KeQueryActiveProcessorCount(NULL)` + `1ull << iter` | 只覆盖当前处理器组；>64 逻辑处理器或跨处理器组的机型需要改用 `GROUP_AFFINITY` |
+
+补充：`IA32_VMX_BASIC`、`IA32_VMX_EPT_VPID_CAP` 等 VMX 能力 MSR 都是每逻辑处理器 MSR。
+Intel SDM Vol. 3C 的 VMX Capability Reporting 要求软件在将要运行 VMX 的那个逻辑处理器上读取这些值；
+P 核与 E 核属于不同微架构，报告的能力位可能不同，具体以实机 `rdmsr` 结果为准。
+
+### 需要调整的 EPT 点（当前未实现）
+
+1. 把 EPT / MTRR 的能力探测和页表构建移进每核初始化路径（`init_logical_processor()` 内、切换到目标核之后），
+   或至少在每个核上重新读取并校验能力。
+2. 每个核读取 `IA32_VMX_EPT_VPID_CAP`，至少处理：bit 20（INVEPT）、bit 25 / 26（single / all-context INVEPT）、
+   bit 6（4 级页遍历）、bit 14（WB）、bit 8（UC）、bit 16（2MB）、bit 21（A/D）。
+3. 选择“所有核都支持”的公共 EPT 配置：仅在所有核支持 2MB 时使用大页；仅在所有核支持 WB 时使用 WB；
+   `page_walk_length` 取公共支持值；否则退回 4KB 页 / UC，或拒绝加载并输出明确的错误信息。
+4. 给 INVEPT 增加能力检查；不支持 INVEPT 的核改用其它 TLB 失效路径，或直接返回不支持并报错，
+   不要在 root 模式下无条件执行。
+5. MTRR 缓存类型表改为每核读取 / 校验，至少校验 P 核与 E 核得到的 MTRR 配置是否一致。
+6. 处理器遍历改为处理器组感知（`KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS)` + `GROUP_AFFINITY`），
+   并单独记录每个核的 VMXON / VMLAUNCH 结果；初始化中途失败时用 `hvgt::vmoff()` 做全核回滚
+   （当前失败路径只调用 `hv::disable_vmx_operation()`，只影响当前核）。
+
+### 实机验证建议
+
+- 分别把线程固定到 P 核和 E 核，读取 `IA32_VMX_BASIC`、`IA32_VMX_EPT_VPID_CAP`，对比 VMCS revision ID、
+  INVEPT、2MB、WB 等能力位；
+- 驱动加载失败时记录 `VM_INSTRUCTION_ERROR`（若出现 VMCS revision 不匹配，常见为 error 12，
+  具体以实测为准）和 bugcheck 参数；
+- 用 `KeSetSystemAffinityThreadEx()` 在单 P 核 / 单 E 核上分别加载驱动，确认问题是否与核类型相关。
+
 ## 已知限制
 
 - 本仓库为原始代码整理版，未在仓库环境中完成构建和真机验证；
 - 与系统版本强绑定：Win10 驱动以 19041.4291 内核头为基线，通过符号加特征码定位内部结构，
   系统更新后可能失效；
 - 仅支持 Intel VT-x / EPT，不包含 AMD-V 实现；
+- Intel Core Ultra 等 P/E 异构核平台的 EPT 尚未按核适配，详见上一节；当前代码未读取
+  `IA32_VMX_EPT_VPID_CAP`。
 - `Initialize` 的加密 KEY 与密钥校验值均为固定值，修改或更换后需要同步用户态与
   DbgkSys 驱动两侧；
 - `SetupHook_DbgkCreateThread_CMP_Debugport` 当前为注释状态；
@@ -452,6 +507,9 @@ C:\Symbols\             # ntoskrnl / win32kbase / win32kfull 符号
 **An Intel VT-x / EPT based Windows kernel debugging support framework (original source code)**
 
 Status: original source (not fully built or validated on real hardware in this repository) · Platform: Windows 10 / 11 x64 · Dependencies: Intel VT-x + EPT
+
+> Known issue: on Intel Core Ultra and other P-core + E-core hybrid platforms, EPT must be adapted per
+> logical processor during initialization; see [Known Issue: Intel Core Ultra Hybrid (P/E) Core EPT Adaptation](#hybrid-ept-en).
 
 UnrealVTDbg (the project name inside the code is UnrealDbg) is a self-contained debugging framework built around an in-kernel VT-x hypervisor. By combining EPT hooks, stealth breakpoints, and control over Dbgk (the Windows kernel debugging subsystem), it attaches a conventional user-mode debugger to a protected process and helps it resist driver-side anti-debugging checks. The project was originally built for Windows 10 / 11 x64 and is tightly coupled to the kernel symbols, structure offsets, and byte signatures of specific OS versions.
 
@@ -816,11 +874,51 @@ Runtime conditions:
 
 Publishing note: the repository `.gitignore` ignores `*.dll`, `*.sys`, and `*.exe`, and the entire `_deps/` directory (`AIHelper.dll`, `VMProtectSDK64.dll`, `UnrealDbg.aes`, and other runtime dependencies and release artifacts) is excluded from source commits. Deploy or release them separately in the runtime directory or as Release assets.
 
+<a name="hybrid-ept-en"></a>
+
+## Known Issue: Intel Core Ultra Hybrid (P/E) Core EPT Adaptation
+
+On Intel Core Ultra (Meteor Lake / Arrow Lake / Lunar Lake, etc.) and other P-core + E-core hybrid platforms, the current EPT initialization is not adapted per logical processor. Possible symptoms:
+
+- the driver completes VMXON / VMLAUNCH on only some cores while initialization fails on the others;
+- the first EPT hook or memory watch triggers a VM-entry failure or an EPT misconfiguration;
+- on a core that does not support INVEPT, executing INVEPT in root mode raises #UD, which appears as a `KMODE_EXCEPTION_NOT_HANDLED` bugcheck when unhandled.
+
+### Root Causes in the Code
+
+| Location | Current implementation | Risk on hybrid cores |
+|---|---|---|
+| `VT_Driver/vmm.cpp: allocate_vmm_context()` | `ept::build_mtrr_map()`, `init_vcpu()`, and `ept::initialize()` all run on the single logical processor that loaded the driver; the per-core affinity loop has not started yet | EPT page tables, `EPTP`, and MTRR memory types for every vCPU come from that one core's capabilities and configuration |
+| `VT_Driver/EPT.cpp: initialize()` | Hard-codes `ept_pointer->memory_type = MEMORY_TYPE_WRITE_BACK` and `page_walk_length = 3` (4-level walk); `create_ept_page_table()` marks every PDE as a 2MB large page | Never reads the `IA32_VMX_EPT_VPID_CAP` bits 14 (WB), 6 (4-level), 16 (2MB), or 20 / 25 / 26 (INVEPT) |
+| `VT_Driver/invalid_ept.cpp`, `vmexit_handler.cpp`, `EPT.cpp` | Calls `invept_all_contexts_func()` / `invept_single_context_func()` unconditionally; `Globals.cpp: enter_vmx_operation()` also executes INVEPT immediately after VMXON succeeds | If the current core does not support INVEPT, executing it in root mode raises #UD and bugchecks the kernel when unhandled |
+| `VT_Driver/Globals.cpp: enter_vmx_operation()` / `load_vmcs_pointer()` | Re-reads `IA32_VMX_BASIC` on the target core and writes the VMXON / VMCS revision ID each time | This part is already per-core correct, but the EPT path has no equivalent handling |
+| `VT_Driver/vmcs.cpp: fill_vmcs()` / `ajdust_controls()` | Reads the `IA32_VMX_*` control MSRs on the target core and clamps the VMCS control fields | VMCS controls are adapted per core, but `EPT_POINTER` still points at an EPT built for a single core |
+| `VT_Driver/vmm.cpp: vmm_init()` | `KeQueryActiveProcessorCount(NULL)` + `1ull << iter` | Covers only the current processor group; machines with more than 64 logical processors or multiple groups need `GROUP_AFFINITY` |
+
+Note: VMX capability MSRs such as `IA32_VMX_BASIC` and `IA32_VMX_EPT_VPID_CAP` are per-logical-processor MSRs. Intel SDM Vol. 3C (VMX Capability Reporting) requires software to read these values on the logical processor that will execute VMX; P-cores and E-cores are different microarchitectures and may report different capability bits. Always confirm with an actual `rdmsr` on the target machine.
+
+### EPT Changes Required (not implemented yet)
+
+1. Move EPT / MTRR capability discovery and page-table construction into the per-core initialization path (inside `init_logical_processor()`, after switching to the target core), or at least re-read and verify the capabilities on every core.
+2. Read `IA32_VMX_EPT_VPID_CAP` per core and handle at least: bit 20 (INVEPT), bits 25 / 26 (single / all-context INVEPT), bit 6 (4-level walk), bit 14 (WB), bit 8 (UC), bit 16 (2MB), and bit 21 (A/D).
+3. Choose a common EPT configuration supported by every core: use large pages only when all cores support 2MB; use WB only when all cores support it; take `page_walk_length` from the common capability set; otherwise fall back to 4KB pages / UC, or refuse to load with a clear error.
+4. Guard INVEPT with a capability check; use another TLB invalidation path on cores that do not support it, or fail explicitly. Never execute it unconditionally in root mode.
+5. Read and verify the MTRR cache-type table per core, or at least verify that P-cores and E-cores report the same MTRR configuration.
+6. Make processor enumeration processor-group aware (`KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS)` + `GROUP_AFFINITY`), record VMXON / VMLAUNCH results per core, and use `hvgt::vmoff()` for a full rollback when initialization fails halfway (the current failure path only calls `hv::disable_vmx_operation()`, which affects the current core only).
+
+### Verification Suggestions
+
+- Pin threads to a P-core and an E-core separately, read `IA32_VMX_BASIC` and `IA32_VMX_EPT_VPID_CAP`, and compare the VMCS revision ID, INVEPT, 2MB, and WB capability bits;
+- capture `VM_INSTRUCTION_ERROR` and the bugcheck parameters when driver loading fails (a VMCS revision mismatch usually appears as VM-instruction error 12; confirm on the target machine);
+- load the driver with `KeSetSystemAffinityThreadEx()` pinned to a single P-core and a single E-core to confirm whether the failure correlates with the core type.
+
 ## Known Limitations
 
 - this repository is a cleaned-up copy of the original source and has not been fully built or validated on real hardware here;
 - it is tightly coupled to OS versions: the Win10 driver is based on the 19041.4291 kernel headers and locates internal structures through symbols plus byte signatures, so OS updates may break it;
 - Intel VT-x / EPT only; there is no AMD-V implementation;
+- EPT is not yet adapted per logical processor on Intel Core Ultra (P/E hybrid) platforms;
+  see the previous section. The current code never reads `IA32_VMX_EPT_VPID_CAP`.
 - the encryption key and key check value used by `Initialize` are hard-coded; changing them requires updating both user mode and the DbgkSys driver;
 - `SetupHook_DbgkCreateThread_CMP_Debugport` is currently commented out;
 - `IOCTL_LOAD_DEBUGGER_STATE` and `IOCTL_LOAD_PROTECT_OBJ_DATA` are currently reserved stubs;
